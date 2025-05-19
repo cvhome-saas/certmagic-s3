@@ -5,251 +5,318 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/caddyserver/certmagic"
+	"go.uber.org/zap"
 	"io"
 	"io/fs"
+	"path"
 	"strings"
 	"time"
-
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/certmagic"
-	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
-	"go.uber.org/zap"
 )
 
-type S3 struct {
-	Logger *zap.Logger
-
-	// S3
-	Client    *minio.Client
-	Host      string `json:"host"`
-	Bucket    string `json:"bucket"`
-	AccessKey string `json:"access_key"`
-	SecretKey string `json:"secret_key"`
-	Prefix    string `json:"prefix"`
-
-	// EncryptionKey is optional. If you do not wish to encrypt your certficates and key inside the S3 bucket, leave it empty.
-	EncryptionKey string `json:"encryption_key"`
-
-	iowrap IO
+func (s *S3Storage) CertMagicStorage() (certmagic.Storage, error) {
+	return s, nil
 }
 
-func init() {
-	caddy.RegisterModule(new(S3))
+// s3ObjectKey constructs the full S3 object key from a CertMagic key and the configured prefix.
+func (s *S3Storage) s3ObjectKey(certMagicKey string) string {
+	// CertMagic keys are already relative paths, e.g., "certificates/example.com/example.com.crt"
+	// We need to ensure they don't have leading slashes before joining with prefix.
+	cleanCertMagicKey := strings.TrimPrefix(certMagicKey, "/")
+	if s.Prefix == "" {
+		return cleanCertMagicKey
+	}
+	return path.Join(s.Prefix, cleanCertMagicKey)
 }
 
-func (s3 *S3) Provision(context caddy.Context) error {
-	s3.Logger = context.Logger(s3)
+// s3LockKey constructs the S3 key for a lock file corresponding to a CertMagic key.
+func (s *S3Storage) s3LockKey(certMagicKey string) string {
+	return s.s3ObjectKey(certMagicKey) + ".lock"
+}
 
-	// S3 Client
-	client, err := minio.New(s3.Host, &minio.Options{
-		Creds:  credentials.NewStaticV4(s3.AccessKey, s3.SecretKey, ""),
-		Secure: true,
+// Lock attempts to acquire a lock for the given CertMagic key.
+func (s *S3Storage) Lock(ctx context.Context, key string) error {
+	lockObjectS3Key := s.s3LockKey(key)
+	s.logger.Debug("attempting to lock", zap.String("key", key), zap.String("s3_lock_key", lockObjectS3Key))
+	startTime := time.Now()
+	lockContent := []byte(startTime.UTC().Format(time.RFC3339Nano)) // Content for the lock file
+
+	for {
+		// Check for context cancellation at the beginning of each attempt.
+		select {
+		case <-ctx.Done():
+			s.logger.Debug("lock attempt cancelled by context", zap.String("key", key))
+			return ctx.Err()
+		default:
+		}
+
+		// Check if lock file exists and its status
+		headOut, err := s.Client.HeadObject(ctx, &awss3.HeadObjectInput{
+			Bucket: aws.String(s.Bucket),
+			Key:    aws.String(lockObjectS3Key),
+		})
+
+		if err == nil { // Lock file exists
+			if headOut.LastModified != nil && time.Since(*headOut.LastModified) < s.lockExpiration {
+				s.logger.Debug("lock exists and is active", zap.String("key", key), zap.Time("lock_modified", *headOut.LastModified))
+				if time.Since(startTime) > s.lockTimeout {
+					return fmt.Errorf("timeout acquiring lock for %s (lock held by another process)", key)
+				}
+				time.Sleep(s.lockPollInterval) // Wait before retrying
+				continue                       // Retry loop
+			}
+			// Lock file exists but is expired, try to overwrite
+			s.logger.Debug("lock exists but is expired, attempting to overwrite", zap.String("key", key))
+		} else {
+			var nsk *types.NoSuchKey
+			var nf *types.NotFound // Some S3-compatibles (like MinIO) return NotFound for HeadObject
+			if !(errors.As(err, &nsk) || errors.As(err, &nf)) {
+				return fmt.Errorf("checking lock for %s: %w", key, err) // Unexpected error
+			}
+			// Lock file does not exist, try to create it
+			s.logger.Debug("lock does not exist, attempting to create", zap.String("key", key))
+		}
+
+		// Attempt to write/overwrite the lock file
+		// For more robust locking, consider S3 conditional Puts (If-Match/If-None-Match).
+		_, putErr := s.Client.PutObject(ctx, &awss3.PutObjectInput{
+			Bucket: aws.String(s.Bucket),
+			Key:    aws.String(lockObjectS3Key),
+			Body:   bytes.NewReader(lockContent),
+		})
+
+		if putErr == nil {
+			s.logger.Info("lock acquired", zap.String("key", key))
+			return nil // Lock acquired
+		}
+
+		s.logger.Error("failed to put lock file, retrying", zap.String("key", key), zap.Error(putErr))
+		if time.Since(startTime) > s.lockTimeout {
+			return fmt.Errorf("timeout acquiring lock for %s after failed put: %w", key, putErr)
+		}
+		time.Sleep(s.lockPollInterval) // Wait before retrying
+	}
+}
+
+// Unlock releases the lock for the given CertMagic key.
+func (s *S3Storage) Unlock(ctx context.Context, key string) error {
+	lockObjectS3Key := s.s3LockKey(key)
+	s.logger.Debug("unlocking", zap.String("key", key), zap.String("s3_lock_key", lockObjectS3Key))
+	_, err := s.Client.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(lockObjectS3Key),
 	})
-
 	if err != nil {
-		return err
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			s.logger.Debug("lock file not found on unlock, already released or never existed", zap.String("key", key))
+			return nil // Not an error if it's already gone
+		}
+		return fmt.Errorf("unlocking %s: %w", key, err)
 	}
-
-	s3.Client = client
-
-	if len(s3.EncryptionKey) == 0 {
-		s3.Logger.Info("Clear text certificate storage active")
-		s3.iowrap = &CleartextIO{}
-	} else if len(s3.EncryptionKey) != 32 {
-		s3.Logger.Error("encryption key must have exactly 32 bytes")
-		return errors.New("encryption key must have exactly 32 bytes")
-	} else {
-		s3.Logger.Info("Encrypted certificate storage active")
-		sb := &SecretBoxIO{}
-		copy(sb.SecretKey[:], []byte(s3.EncryptionKey))
-		s3.iowrap = sb
-	}
-
+	s.logger.Info("lock released", zap.String("key", key))
 	return nil
 }
 
-func (s3 *S3) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID: "caddy.storage.s3",
-		New: func() caddy.Module {
-			return new(S3)
-		},
-	}
-}
+// Store stores the given value at the given CertMagic key.
+func (s *S3Storage) Store(ctx context.Context, key string, value []byte) error {
+	s3Key := s.s3ObjectKey(key)
+	s.logger.Debug("storing", zap.String("key", key), zap.String("s3_key", s3Key), zap.Int("size", len(value)))
 
-var (
-	LockExpiration   = 2 * time.Minute
-	LockPollInterval = 1 * time.Second
-	LockTimeout      = 15 * time.Second
-)
-
-func (s3 *S3) Lock(ctx context.Context, key string) error {
-	s3.Logger.Info(fmt.Sprintf("Lock: %v", s3.objName(key)))
-	var startedAt = time.Now()
-
-	for {
-		obj, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objLockName(key), minio.GetObjectOptions{})
-		if err == nil {
-			return s3.putLockFile(ctx, key)
-		}
-		buf, err := io.ReadAll(obj)
-		if err != nil {
-			// Retry
-			continue
-		}
-		lt, err := time.Parse(time.RFC3339, string(buf))
-		if err != nil {
-			// Lock file does not make sense, overwrite.
-			return s3.putLockFile(ctx, key)
-		}
-		if lt.Add(LockTimeout).Before(time.Now()) {
-			// Existing lock file expired, overwrite.
-			return s3.putLockFile(ctx, key)
-		}
-
-		if startedAt.Add(LockTimeout).Before(time.Now()) {
-			return errors.New("acquiring lock failed")
-		}
-		time.Sleep(LockPollInterval)
-	}
-}
-
-func (s3 *S3) putLockFile(ctx context.Context, key string) error {
-	// Object does not exist, we're creating a lock file.
-	r := bytes.NewReader([]byte(time.Now().Format(time.RFC3339)))
-	_, err := s3.Client.PutObject(ctx, s3.Bucket, s3.objLockName(key), r, int64(r.Len()), minio.PutObjectOptions{})
-	return err
-}
-
-func (s3 *S3) Unlock(ctx context.Context, key string) error {
-	s3.Logger.Info(fmt.Sprintf("Release lock: %v", s3.objName(key)))
-	return s3.Client.RemoveObject(ctx, s3.Bucket, s3.objLockName(key), minio.RemoveObjectOptions{})
-}
-
-func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
-	r := s3.iowrap.ByteReader(value)
-	s3.Logger.Info(fmt.Sprintf("Store: %v, %v bytes", s3.objName(key), len(value)))
-	_, err := s3.Client.PutObject(ctx,
-		s3.Bucket,
-		s3.objName(key),
-		r,
-		int64(r.Len()),
-		minio.PutObjectOptions{},
-	)
-	return err
-}
-
-func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
-	s3.Logger.Info(fmt.Sprintf("Load: %v", s3.objName(key)))
-	r, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objName(key), minio.GetObjectOptions{})
+	reader, length, err := s.iowrap.ByteReader(value) // Handles encryption if enabled
 	if err != nil {
-		if err.Error() == "The specified key does not exist." {
-			return nil, fs.ErrNotExist
+		return fmt.Errorf("preparing data for storing %s: %w", key, err)
+	}
+
+	_, err = s.Client.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket:        aws.String(s.Bucket),
+		Key:           aws.String(s3Key),
+		Body:          reader,
+		ContentLength: aws.Int64(length), // Important for S3
+	})
+	if err != nil {
+		return fmt.Errorf("storing %s (s3://%s/%s): %w", key, s.Bucket, s3Key, err)
+	}
+	return nil
+}
+
+// Load retrieves the value at the given CertMagic key.
+func (s *S3Storage) Load(ctx context.Context, key string) ([]byte, error) {
+	s3Key := s.s3ObjectKey(key)
+	s.logger.Debug("loading", zap.String("key", key), zap.String("s3_key", s3Key))
+
+	result, err := s.Client.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return nil, fs.ErrNotExist // CertMagic expects fs.ErrNotExist
 		}
-		return nil, err
-	} else if r != nil {
-		// AWS (at least) doesn't return an error on key doesn't exist. We have
-		// to examine the empty object returned.
-		_, err = r.Stat()
+		return nil, fmt.Errorf("loading %s (s3://%s/%s): %w", key, s.Bucket, s3Key, err)
+	}
+	defer result.Body.Close()
+
+	decryptedReader := s.iowrap.WrapReader(result.Body) // Handles decryption
+	data, err := io.ReadAll(decryptedReader)
+	if err != nil {
+		// Check if the error came from our errorReader (e.g., decryption failed)
+		var er *errorReader
+		if errors.As(err, &er) {
+			return nil, fmt.Errorf("reading/decrypting data for %s: %w", key, er.err)
+		}
+		return nil, fmt.Errorf("reading data for %s: %w", key, err)
+	}
+	return data, nil
+}
+
+// Delete deletes the value at the given CertMagic key.
+func (s *S3Storage) Delete(ctx context.Context, key string) error {
+	s3Key := s.s3ObjectKey(key)
+	s.logger.Debug("deleting", zap.String("key", key), zap.String("s3_key", s3Key))
+
+	_, err := s.Client.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		// CertMagic often doesn't treat "not found" on delete as an error.
+		// We log it but return nil to align with typical expectations.
+		s.logger.Warn("error deleting object from S3, may or may not be an issue depending on context",
+			zap.String("key", key), zap.String("s3_key", s3Key), zap.Error(err))
+	}
+	return nil // Typically, CertMagic expects nil even if the object didn't exist.
+}
+
+// Exists returns true if the given CertMagic key exists.
+func (s *S3Storage) Exists(ctx context.Context, key string) bool {
+	s3Key := s.s3ObjectKey(key)
+	s.logger.Debug("checking exists", zap.String("key", key), zap.String("s3_key", s3Key))
+
+	_, err := s.Client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		var nsk *types.NoSuchKey
+		var nf *types.NotFound // Some S3-compatibles might return NotFound
+		if errors.As(err, &nsk) || errors.As(err, &nf) {
+			return false // Key does not exist
+		}
+		// For other errors, log it and conservatively return false.
+		s.logger.Error("error checking existence for key", zap.String("key", key), zap.Error(err))
+		return false
+	}
+	return true // HeadObject succeeded, so key exists
+}
+
+// List returns a list of CertMagic keys that match the given prefix.
+func (s *S3Storage) List(ctx context.Context, listPrefix string, recursive bool) ([]string, error) {
+	// s3ObjectKey will handle adding the main storage prefix.
+	// listPrefix is the prefix *within* the CertMagic storage view.
+	s3ListPrefix := s.s3ObjectKey(listPrefix)
+
+	// For S3, if listing a "directory", the prefix should usually end with a slash.
+	// If listPrefix is empty, s3ListPrefix will be s.Prefix. If s.Prefix is "certs", s3ListPrefix becomes "certs/".
+	// If listPrefix is "sites", s3ListPrefix becomes "s.Prefix/sites/".
+	if s3ListPrefix != "" && !strings.HasSuffix(s3ListPrefix, "/") {
+		s3ListPrefix += "/"
+	}
+	// If s3ListPrefix was originally empty (meaning s.Prefix and listPrefix were both empty, listing bucket root),
+	// it remains empty, which is correct for ListObjectsV2 to list bucket root.
+
+	s.logger.Debug("listing",
+		zap.String("certmagic_prefix_arg", listPrefix),
+		zap.String("s3_resolved_list_prefix", s3ListPrefix),
+		zap.Bool("recursive", recursive))
+
+	var keys []string
+	var delimiter *string
+	if !recursive {
+		delimiter = aws.String("/") // S3's way of listing one level
+	}
+
+	paginator := awss3.NewListObjectsV2Paginator(s.Client, &awss3.ListObjectsV2Input{
+		Bucket:    aws.String(s.Bucket),
+		Prefix:    aws.String(s3ListPrefix),
+		Delimiter: delimiter,
+	})
+
+	// This is the prefix we need to strip from full S3 keys to get back to CertMagic keys.
+	// If s.Prefix is "foo", this will be "foo/". If s.Prefix is "", this will be "".
+	stripPrefixFromS3Key := ""
+	if s.Prefix != "" {
+		stripPrefixFromS3Key = s.Prefix + "/"
+	}
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			er := minio.ToErrorResponse(err)
-			if er.StatusCode == 404 {
-				return nil, fs.ErrNotExist
+			return nil, fmt.Errorf("listing s3://%s/%s: %w", s.Bucket, s3ListPrefix, err)
+		}
+
+		// Add common prefixes (directories) if not recursive
+		if !recursive {
+			for _, cp := range page.CommonPrefixes {
+				if cp.Prefix != nil {
+					// S3 common prefixes include the full path. Make it relative to CertMagic root.
+					key := strings.TrimPrefix(*cp.Prefix, stripPrefixFromS3Key)
+					key = strings.TrimSuffix(key, "/") // CertMagic expects dir names without trailing slash
+					if key != "" && !strings.HasSuffix(key, ".lock") {
+						keys = append(keys, key)
+					}
+				}
 			}
 		}
-	}
-	defer r.Close()
-	buf, err := io.ReadAll(s3.iowrap.WrapReader(r))
-	if err != nil {
-		return nil, err
-	}
-	return buf, nil
-}
 
-func (s3 *S3) Delete(ctx context.Context, key string) error {
-	s3.Logger.Info(fmt.Sprintf("Delete: %v", s3.objName(key)))
-	return s3.Client.RemoveObject(ctx, s3.Bucket, s3.objName(key), minio.RemoveObjectOptions{})
-}
-
-func (s3 *S3) Exists(ctx context.Context, key string) bool {
-	s3.Logger.Info(fmt.Sprintf("Exists: %v", s3.objName(key)))
-	_, err := s3.Client.StatObject(ctx, s3.Bucket, s3.objName(key), minio.StatObjectOptions{})
-	return err == nil
-}
-
-func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-	var keys []string
-	for obj := range s3.Client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    s3.objName(""),
-		Recursive: true,
-	}) {
-		keys = append(keys, obj.Key)
+		// Add objects
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				// S3 keys include the full path. Make it relative to CertMagic root.
+				// Also, skip the "directory marker" object if S3 returns one (its key is same as prefix).
+				if *obj.Key == s3ListPrefix && strings.HasSuffix(s3ListPrefix, "/") {
+					continue
+				}
+				key := strings.TrimPrefix(*obj.Key, stripPrefixFromS3Key)
+				if key != "" && !strings.HasSuffix(key, ".lock") {
+					keys = append(keys, key)
+				}
+			}
+		}
 	}
 	return keys, nil
 }
 
-func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	s3.Logger.Info(fmt.Sprintf("Stat: %v", s3.objName(key)))
+// Stat returns information about the given CertMagic key.
+func (s *S3Storage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
+	s3Key := s.s3ObjectKey(key)
+	s.logger.Debug("stat", zap.String("key", key), zap.String("s3_key", s3Key))
 	var ki certmagic.KeyInfo
-	oi, err := s3.Client.StatObject(ctx, s3.Bucket, s3.objName(key), minio.StatObjectOptions{})
+
+	result, err := s.Client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(s3Key),
+	})
 	if err != nil {
-		return ki, fs.ErrNotExist
+		var nsk *types.NoSuchKey
+		var nf *types.NotFound
+		if errors.As(err, &nsk) || errors.As(err, &nf) {
+			return ki, fs.ErrNotExist // CertMagic expects fs.ErrNotExist
+		}
+		return ki, fmt.Errorf("stat %s (s3://%s/%s): %w", key, s.Bucket, s3Key, err)
 	}
-	ki.Key = key
-	ki.Size = oi.Size
-	ki.Modified = oi.LastModified
-	ki.IsTerminal = true
+
+	ki.Key = key // CertMagic expects the original, unprefixed key
+	if result.ContentLength != nil {
+		ki.Size = *result.ContentLength
+	}
+	if result.LastModified != nil {
+		ki.Modified = *result.LastModified
+	}
+	ki.IsTerminal = true // All S3 objects are considered "files" or terminal nodes
 	return ki, nil
 }
-
-func (s3 *S3) objName(key string) string {
-	return fmt.Sprintf("%s/%s", strings.TrimPrefix(s3.Prefix, "/"), strings.TrimPrefix(key, "/"))
-}
-
-func (s3 *S3) objLockName(key string) string {
-	return s3.objName(key) + ".lock"
-}
-
-// CertMagicStorage converts s to a certmagic.Storage instance.
-func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
-	return s3, nil
-}
-
-func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		key := d.Val()
-		var value string
-
-		if !d.Args(&value) {
-			continue
-		}
-
-		switch key {
-		case "host":
-			s3.Host = value
-		case "bucket":
-			s3.Bucket = value
-		case "access_key":
-			s3.AccessKey = value
-		case "secret_key":
-			s3.SecretKey = value
-		case "prefix":
-			if value != "" {
-				s3.Prefix = value
-			} else {
-				s3.Prefix = "acme"
-			}
-		case "encryption_key":
-			s3.EncryptionKey = value
-		}
-	}
-	return nil
-}
-
-var (
-	_ caddy.Provisioner      = (*S3)(nil)
-	_ caddy.StorageConverter = (*S3)(nil)
-	_ caddyfile.Unmarshaler  = (*S3)(nil)
-)
