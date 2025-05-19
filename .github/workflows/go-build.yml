@@ -1,0 +1,35 @@
+name: Go Build Check # Name of the workflow
+
+# Controls when the workflow will run
+on:
+  push: # Run on pushes to the main branch
+    branches: [ main, master ] # Adjust branch names if needed
+  pull_request: # Run on pull requests targeting the main branch
+    branches: [ main, master ] # Adjust branch names if needed
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+  build: # Define a job named 'build'
+    name: Build Caddy Plugin
+    runs-on: ubuntu-latest # Use the latest Ubuntu runner provided by GitHub
+
+    steps:
+      # 1. Check out the repository code
+      - name: Check out code
+        uses: actions/checkout@v4 # Use the standard checkout action
+
+      # 2. Set up the Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v5 # Use the standard Go setup action
+        with:
+          go-version: '1.21' # Specify the Go version your project uses (adjust if needed)
+          cache: true # Enable Go build/module caching for faster subsequent runs
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Build plugin
+        run: go build ./...
+
+      - name: Build Successful
+        run: echo "Go build completed successfully."
