@@ -1,1 +1,3 @@
 /.idea/*
+.claude/worktrees/
+.DS_Store
