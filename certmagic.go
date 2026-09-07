@@ -147,12 +147,8 @@ func (s *S3Storage) Load(ctx context.Context, key string) ([]byte, error) {
 	decryptedReader := s.iowrap.WrapReader(result.Body) // Handles decryption
 	data, err := io.ReadAll(decryptedReader)
 	if err != nil {
-		// Check if the error came from our errorReader (e.g., decryption failed)
-		var er *errorReader
-		if errors.As(err, &er) {
-			return nil, fmt.Errorf("reading/decrypting data for %s: %w", key, er.err)
-		}
-		return nil, fmt.Errorf("reading data for %s: %w", key, err)
+		// errorReader.Read returns its wrapped error itself, so a decryption failure arrives here as err.
+		return nil, fmt.Errorf("reading/decrypting data for %s: %w", key, err)
 	}
 	return data, nil
 }

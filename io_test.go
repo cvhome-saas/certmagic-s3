@@ -17,11 +17,14 @@ func TestEncryptDecrypt(t *testing.T) {
 	}
 
 	msg := []byte("This is a very important message that shall be encrypted...")
-	r := sb.ByteReader(msg)
+	r, _, err := sb.ByteReader(msg)
+	if err != nil {
+		t.Fatalf("encrypting failed: %v", err)
+	}
 
 	buf, err := io.ReadAll(r)
 	if err != nil {
-		t.Errorf("encrypting failed: %v", err)
+		t.Errorf("reading ciphertext failed: %v", err)
 	}
 
 	w := bytes.NewReader(buf)
@@ -43,9 +46,11 @@ func TestIOWrap(t *testing.T) {
 	sb := SecretBoxIO{}
 	wr := sb.WrapReader(empty)
 
+	// An empty stream has no nonce, so it is not ciphertext: the wrapper must refuse it with a clear
+	// error rather than pretend it decrypted to nothing.
 	buf, err := io.ReadAll(wr)
-	if err != nil {
-		t.Errorf("reading failed: %s", err)
+	if err == nil {
+		t.Errorf("expected a short-stream error for empty input, got none")
 	}
 	if len(buf) != 0 {
 		t.Errorf("Buffer should be empty, got: %v", buf)
