@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# A push is allowed only for a tree that `scripts/verify.sh` has passed in full.
+#
+# The script writes `<git-dir>/verified` with a digest of HEAD plus every uncommitted change;
+# this hook recomputes the digest and refuses the push when they differ — no receipt, a receipt for
+# an older tree, or an edit since the run. Installed by the script itself (`core.hooksPath`), so a
+# clone that has never verified has never pushed either.
+#
+# `SKIP_VERIFY=1 git push` is the escape hatch for a deliberate exception (reverting a broken main,
+# say). It is an environment variable rather than `--no-verify` so it has to be typed on purpose and
+# shows in the shell history; the Claude hook refuses `--no-verify` outright.
+set -euo pipefail
+
+if [ "${SKIP_VERIFY:-}" = "1" ]; then
+  echo "pre-push: SKIP_VERIFY=1 — pushing without the local pipeline run. The remote pipeline still runs." >&2
+  exit 0
+fi
+
+# A push that only deletes remote refs carries no tree to verify. git hands each ref on stdin as
+# "<local ref> <local sha> <remote ref> <remote sha>", and a deletion's local sha is all zeros.
+zero="0000000000000000000000000000000000000000"
+updates=0
+to_main=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  if [ "${remote_ref:-}" = "refs/heads/main" ]; then
+    to_main=1
+  fi
+  if [ -n "${local_sha:-}" ] && [ "$local_sha" != "$zero" ]; then
+    updates=$((updates + 1))
+  fi
+done
+
+# main only ever receives a PR merge — never a push, receipt or no receipt, update or deletion. A topic
+# branch cut with `git worktree add -b x origin/main` and no --no-track tracks main, and a bare
+# `git push` from it would land here; that is the case this exists for.
+if [ "$to_main" -eq 1 ]; then
+  cat >&2 <<MSG
+pre-push: refused — this push targets main.
+
+main is the integration branch and only ever receives a PR merge (AGENTS.md, Working conventions).
+If this branch tracks origin/main, the worktree was cut without --no-track; push it to its own
+remote branch instead:
+
+  git push -u origin HEAD
+MSG
+  exit 1
+fi
+
+if [ "$updates" -eq 0 ]; then
+  exit 0
+fi
+
+git_dir="$(git rev-parse --absolute-git-dir)"
+receipt="$git_dir/verified"
+current="$({ git rev-parse HEAD; git status --porcelain=v1 --untracked-files=all; git diff HEAD; } | shasum -a 256 | cut -d' ' -f1)"
+
+if [ -f "$receipt" ] && [ "$(cat "$receipt")" = "$current" ]; then
+  exit 0
+fi
+
+cat >&2 <<MSG
+pre-push: refused — this tree has not passed the local pipeline run.
+
+  $( [ -f "$receipt" ] && echo "The last receipt is for a different tree (something was committed or edited since)." || echo "No receipt exists for this clone yet." )
+
+Run the whole pipeline locally first, then push:
+
+  scripts/verify.sh
+
+It runs every gate in scripts/verify.steps.sh — the same checks CI runs — so a green run here is a green
+pipeline there. Commit first, then verify, then push: the receipt is for the committed tree.
+MSG
+exit 1
