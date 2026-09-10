@@ -24,11 +24,13 @@ Part of the `cvhome-saas` organisation. Cross-repo routing, review and releases 
   `<type>` ∈ `feat|fix|docs|chore|refactor|test`. Work, build and verify from inside that worktree; the
   primary checkout stays clean on `main`. `.claude/hooks/worktree-guard.mjs` denies any edit in the primary
   checkout (`ALLOW_MAIN_WRITES=1` is the person's deliberate escape hatch, never the agent's).
-- **A plan is phases; a phase is one PR.** Anything bigger than one PR starts as
+- **A plan is one PR; each phase is one commit.** Anything bigger than one commit starts as
   `.agents/plans/<kebab-name>.md` (template: `.agents/plans/README.md`): context, why the design is what it
-  is, then `## Phase N — <area> (PR N)` sections each small enough to review in one sitting, then
-  deviations as built and verification. One plan, one worktree, one branch; each phase is committed and
-  shipped as its own PR before the next begins (stacked if it must). A plan that touches another repo names
+  is, then `## Phase N — <area>` sections each small enough to review in one sitting, then
+  deviations as built and verification. One plan, one worktree, one branch, **one PR**; each phase is a
+  commit on it, easiest first, so a reviewer reads the sequence and any one phase can be reverted alone.
+  Never a PR per phase: stacked PRs re-conflict each other on every merge and each has to re-earn its
+  verify receipt. A plan that touches another repo names
   it and hands that phase to the orchestrator (`cross-repo-change`).
 - **Nothing is pushed until the gates have passed locally.** `scripts/verify.sh` runs exactly what CI runs
   (`scripts/verify.steps.sh`) and writes a receipt for the exact tree; `.githooks/pre-push` and
